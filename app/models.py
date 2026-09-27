@@ -253,3 +253,72 @@ class RestViolationsResponse(BaseModel):
     violations: list[RestViolationOut] = Field(
         ..., description="低于阈值的空档，按起点排序；均达标时为空列表"
     )
+
+
+MAX_FREE_SLOT_WINDOW_DAYS = 31
+
+
+class FreeSlotsParticipant(BaseModel):
+    """一名参与者：可为空的日程列表（沿用 /overlaps 单侧参数与校验）。"""
+
+    schedules: list[OverlapSide] | None = Field(
+        default=None,
+        description="日程列表（与 /overlaps 单侧相同）；null 或空列表表示全程空闲",
+    )
+
+
+class CommonFreeSlotsRequest(BaseModel):
+    window_start_utc: datetime = Field(
+        ..., description="查询窗口起点（含），UTC，ISO 8601 且以 Z 结尾"
+    )
+    window_end_utc: datetime = Field(
+        ..., description="查询窗口终点（不含），UTC，ISO 8601 且以 Z 结尾"
+    )
+    duration_minutes: int = Field(
+        ..., ge=1, le=1440, description="预约时长（分钟），1～1440"
+    )
+    step_minutes: int = Field(
+        ..., ge=1, le=1440, description="网格步长（分钟），1～1440"
+    )
+    participants: list[FreeSlotsParticipant] = Field(
+        ..., min_length=1, max_length=10, description="1～10 名参与者"
+    )
+
+    @field_validator("window_start_utc", "window_end_utc", mode="before")
+    @classmethod
+    def _require_z_suffix(cls, v: object) -> object:
+        """窗口起止必须是以 Z 结尾的 UTC ISO 8601 字符串。"""
+        if isinstance(v, str) and not v.endswith("Z"):
+            raise ValueError("must be an ISO 8601 UTC timestamp ending with 'Z'")
+        return v
+
+    @field_validator("window_start_utc", "window_end_utc")
+    @classmethod
+    def _normalize_utc(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("must be a timezone-aware UTC timestamp ending with 'Z'")
+        return v.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def _validate_window(self) -> "CommonFreeSlotsRequest":
+        if not self.window_start_utc < self.window_end_utc:
+            raise ValueError("window_start_utc must be before window_end_utc")
+        if self.window_end_utc - self.window_start_utc > timedelta(
+            days=MAX_FREE_SLOT_WINDOW_DAYS
+        ):
+            raise ValueError(
+                f"window must not exceed {MAX_FREE_SLOT_WINDOW_DAYS} days"
+            )
+        return self
+
+
+class FreeSlotOut(BaseModel):
+    start_utc: str = Field(..., description="预约槽起点（含），UTC，Z 结尾")
+    end_utc: str = Field(..., description="预约槽终点（不含），UTC，Z 结尾")
+
+
+class CommonFreeSlotsResponse(BaseModel):
+    count: int = Field(..., description="可用预约槽数")
+    slots: list[FreeSlotOut] = Field(
+        ..., description="能完整容纳预约的网格起点及对应终点，按起点 UTC 升序"
+    )

@@ -9,7 +9,9 @@ UTC 时间与决策原因。`POST /overlaps` 在此基础上为两个日程各�
 `POST /staffing-gaps` 在 UTC 窗口内扫描多名员工的上下岗事件，
 输出在岗人数低于最低要求的缺员区间；`POST /rest-violations`
 把同一员工的多条日程在真实 UTC 时间轴上合并为工作段，
-检查相邻工作段之间的休息空档是否低于最低分钟数。
+检查相邻工作段之间的休息空档是否低于最低分钟数；
+`POST /common-free-slots` 把每名参与者的忙碌区间合并后取窗口内的共同空闲，
+按**以窗口起点为原点的步长网格**枚举能完整容纳预约的起止时刻。
 
 ## 快速启动（单条命令）
 
@@ -22,7 +24,7 @@ docker compose up --build
 - 服务地址： http://localhost:8000
 - 交互式文档（Swagger UI）： http://localhost:8000/docs
 - 健康检查： http://localhost:8000/health
-- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`、`/rest-violations`
+- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`、`/rest-violations`、`/common-free-slots`
 
 ## 配置
 
@@ -356,6 +358,89 @@ docker compose up --build
 空档恰好等于阈值不算违规；所有空档均达标（或工作段不足两段）时
 `violations` 为空列表。
 
+### `POST /common-free-slots`
+
+在半开 UTC 窗口 `[window_start_utc, window_end_utc)` 内查询 **1～10 名参与者**
+共同空闲、且能完整容纳一次预约的全部网格起点。每名参与者携带**可为空**的
+日程列表（`schedules`，与 `/overlaps` 单侧参数与校验完全一致）；`null` 或
+空列表表示该参与者**全程空闲**。各日程按既有跳时 / 叠时策略展开后，实例按
+真实时长解释为**半开 UTC 区间** `[start, start+duration)`；同一参与者相交或
+相接的忙碌段先合并（**重复实例不重复占用**），再取全体忙碌并集，窗口减去
+并集即为共同空闲段。以**窗口起点为步长网格原点**（步长 `step_minutes`），
+仅返回能完整容纳 `[t, t+duration_minutes)` 的网格起点 `t` 及对应终点
+（**边界相接允许预约**），结果按 UTC 升序。
+
+请求体：
+
+```json
+{
+  "window_start_utc": "2026-03-02T08:00:00Z",
+  "window_end_utc": "2026-03-02T12:00:00Z",
+  "duration_minutes": 30,
+  "step_minutes": 30,
+  "participants": [
+    {
+      "schedules": [
+        {
+          "timezone": "Europe/Berlin",
+          "start_date": "2026-03-02",
+          "end_date": "2026-03-02",
+          "weekdays": [0],
+          "local_time": "09:00",
+          "duration_minutes": 60
+        }
+      ]
+    },
+    {
+      "schedules": [
+        {
+          "timezone": "America/New_York",
+          "start_date": "2026-03-02",
+          "end_date": "2026-03-02",
+          "weekdays": [0],
+          "local_time": "03:30",
+          "duration_minutes": 60
+        }
+      ]
+    },
+    {"schedules": null}
+  ]
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `window_start_utc` / `window_end_utc` | string | 查询窗口起止（半开），UTC ISO 8601 且**以 `Z` 结尾**；须递增且不超过 31 天 |
+| `duration_minutes` | int | 预约时长（分钟），`1`～`1440` |
+| `step_minutes` | int | 网格步长（分钟），`1`～`1440`；网格原点为窗口起点 |
+| `participants` | object[] | `1`～`10` 名参与者 |
+| `participants[].schedules` | object[] \| null | 日程列表（与 `/overlaps` 单侧相同）；`null` 或空列表表示全程空闲 |
+
+响应 `200`（`slots` 按 `start_utc` 升序）：
+
+```json
+{
+  "count": 5,
+  "slots": [
+    {"start_utc": "2026-03-02T09:30:00Z", "end_utc": "2026-03-02T10:00:00Z"},
+    {"start_utc": "2026-03-02T10:00:00Z", "end_utc": "2026-03-02T10:30:00Z"},
+    {"start_utc": "2026-03-02T10:30:00Z", "end_utc": "2026-03-02T11:00:00Z"},
+    {"start_utc": "2026-03-02T11:00:00Z", "end_utc": "2026-03-02T11:30:00Z"},
+    {"start_utc": "2026-03-02T11:30:00Z", "end_utc": "2026-03-02T12:00:00Z"}
+  ]
+}
+```
+
+上例中柏林 09:00 CET = 08:00 UTC 忙碌 60 分钟、纽约 03:30 EST = 08:30 UTC
+忙碌 60 分钟，忙碌并集为 `[08:00, 09:30)`；第三名参与者全程空闲。共同空闲
+`[09:30, 12:00)` 内，以 08:00 为原点、30 分钟步长的网格起点 `09:30` 起
+均可完整容纳 30 分钟预约（`11:30` 的终点与窗口终点相接，允许）。
+
+| 字段 | 说明 |
+| --- | --- |
+| `count` | 可用预约槽数 |
+| `slots[].start_utc` / `slots[].end_utc` | 预约槽起止（半开，UTC，Z 结尾），终点 = 起点 + `duration_minutes` |
+
 ### 错误（422）
 
 以下情况返回 `422 Unprocessable Entity`：
@@ -369,6 +454,10 @@ docker compose up --build
   `min_staff` 不在 1～员工总数、员工数不在 1～20、员工 ID 重复
 - `/rest-violations`：`schedules` 为空、`min_rest_minutes` 小于 1，
   或任一日程字段校验失败（规则与 `/overlaps` 单侧一致）
+- `/common-free-slots`：窗口起止不是以 `Z` 结尾的 UTC 时刻、窗口未递增或
+  超过 31 天、`duration_minutes` / `step_minutes` 不在 1～1440、
+  参与者数不在 1～10，或任一参与者的日程字段校验失败
+  （规则与 `/overlaps` 单侧一致）
 
 ## 判定原理
 
@@ -390,9 +479,9 @@ pytest                               # 运行测试
 
 ```
 app/
-  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps、/rest-violations 与 /health
+  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps、/rest-violations、/common-free-slots 与 /health
   models.py      # 请求/响应模型与 422 校验规则
-  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计 + 在岗缺口扫描 + 休息违规检查
+  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计 + 在岗缺口扫描 + 休息违规检查 + 共同空闲预约槽枚举
 tests/           # pytest 测试（核心逻辑 + API）
 Dockerfile
 docker-compose.yml

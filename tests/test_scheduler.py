@@ -8,6 +8,7 @@ from app.scheduler import (
     RestViolation,
     StaffingGap,
     classify,
+    common_free_slots,
     expand_schedule,
     find_overlaps,
     merge_intervals,
@@ -493,3 +494,104 @@ def test_rest_violations_unsorted_input_and_single_segment():
     assert violations == [RestViolation(_utc(1, 9), _utc(1, 10))]
     assert rest_violations(intervals=[(_utc(1, 8), _utc(1, 9))], min_rest_minutes=1) == []
     assert rest_violations(intervals=[], min_rest_minutes=1) == []
+
+
+# --- common_free_slots ------------------------------------------------------
+
+
+def test_common_free_slots_basic():
+    # alice 忙 [08:00,09:00)，bob 忙 [09:30,10:30)；窗口 [08:00,12:00)
+    # 共同空闲 [09:00,09:30) 与 [10:30,12:00)；时长 30、步长 15
+    slots = common_free_slots(
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 12),
+        duration_minutes=30,
+        step_minutes=15,
+        participant_intervals=[
+            [(_utc(1, 8), _utc(1, 9))],
+            [(_utc(1, 9, 30), _utc(1, 10, 30))],
+        ],
+    )
+    assert slots == [
+        (_utc(1, 9), _utc(1, 9, 30)),  # 两端均与忙碌相接，允许
+        (_utc(1, 10, 30), _utc(1, 11)),
+        (_utc(1, 10, 45), _utc(1, 11, 15)),
+        (_utc(1, 11), _utc(1, 11, 30)),
+        (_utc(1, 11, 15), _utc(1, 11, 45)),
+        (_utc(1, 11, 30), _utc(1, 12)),
+    ]
+
+
+def test_common_free_slots_grid_origin_is_window_start():
+    # 网格以窗口起点为原点，而非整点：08:07 起每 20 分钟一格
+    slots = common_free_slots(
+        window_start=_utc(1, 8, 7),
+        window_end=_utc(1, 9, 7),
+        duration_minutes=20,
+        step_minutes=20,
+        participant_intervals=[[]],
+    )
+    assert slots == [
+        (_utc(1, 8, 7), _utc(1, 8, 27)),
+        (_utc(1, 8, 27), _utc(1, 8, 47)),
+        (_utc(1, 8, 47), _utc(1, 9, 7)),
+    ]
+
+
+def test_common_free_slots_merges_busy_and_counts_duplicate_once():
+    # 同一参与者相交区间合并；完全重复的实例不重复占用
+    slots = common_free_slots(
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 12),
+        duration_minutes=60,
+        step_minutes=30,
+        participant_intervals=[
+            [(_utc(1, 8), _utc(1, 9)), (_utc(1, 8, 30), _utc(1, 10))],  # 相交 -> [08:00,10:00)
+            [(_utc(1, 10), _utc(1, 11)), (_utc(1, 10), _utc(1, 11))],  # 重复 -> 只计一次
+        ],
+    )
+    # 忙碌并集 [08:00,11:00)，共同空闲仅 [11:00,12:00)
+    assert slots == [(_utc(1, 11), _utc(1, 12))]
+
+
+def test_common_free_slots_clips_to_window():
+    # 忙碌区间越界部分被裁剪；网格点早于空闲段起点时被跳过
+    slots = common_free_slots(
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 10),
+        duration_minutes=60,
+        step_minutes=60,
+        participant_intervals=[[(_utc(0, 23), _utc(1, 8, 30))]],
+    )
+    # 忙碌裁剪为 [08:00,08:30)；网格点 08:00 放不下，仅 09:00 可行
+    assert slots == [(_utc(1, 9), _utc(1, 10))]
+
+
+def test_common_free_slots_empty_when_no_segment_fits():
+    # 唯一空闲段 [08:15,09:00) 仅 45 分钟，容纳不下 60 分钟预约
+    assert (
+        common_free_slots(
+            window_start=_utc(1, 8),
+            window_end=_utc(1, 9),
+            duration_minutes=60,
+            step_minutes=15,
+            participant_intervals=[[(_utc(1, 8), _utc(1, 8, 15))]],
+        )
+        == []
+    )
+
+
+def test_common_free_slots_all_participants_must_be_free():
+    # 三人轮转占满全天：任何时刻都有人忙 -> 无共同空闲
+    slots = common_free_slots(
+        window_start=_utc(1, 0),
+        window_end=_utc(2, 0),
+        duration_minutes=30,
+        step_minutes=30,
+        participant_intervals=[
+            [(_utc(1, 0), _utc(1, 8))],
+            [(_utc(1, 8), _utc(1, 16))],
+            [(_utc(1, 16), _utc(2, 0))],
+        ],
+    )
+    assert slots == []
