@@ -1276,3 +1276,330 @@ def test_rest_violations_reuses_schedule_validation():
         },
     )
     assert resp.status_code == 422
+
+
+# --- POST /common-free-slots -------------------------------------------------
+
+# 窗口：2026-03-02 07:00–12:00 UTC
+FREE_WINDOW = {
+    "window_start_utc": "2026-03-02T07:00:00Z",
+    "window_end_utc": "2026-03-02T12:00:00Z",
+}
+
+
+def _free_schedule(local_time: str, duration: int = 60, **overrides) -> dict:
+    schedule = {
+        "timezone": "UTC",
+        "start_date": "2026-03-02",
+        "end_date": "2026-03-02",
+        "weekdays": [0],
+        "local_time": local_time,
+        "duration_minutes": duration,
+    }
+    schedule.update(overrides)
+    return schedule
+
+
+def _free_payload(**overrides):
+    payload = {
+        **FREE_WINDOW,
+        "duration_minutes": 60,
+        "step_minutes": 30,
+        "participants": [
+            {"schedules": [_free_schedule("08:00")]},  # 忙 [08:00,09:00) UTC
+            {"schedules": [_free_schedule("09:30")]},  # 忙 [09:30,10:30) UTC
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_common_free_slots_basic():
+    resp = client.post("/common-free-slots", json=_free_payload())
+    assert resp.status_code == 200
+    # 共同空闲 [07:00,08:00) [09:00,09:30) [10:30,12:00)；
+    # [09:00,09:30) 不足 60 分钟，其余按 30 分钟步长（自 07:00 起算）取点
+    assert resp.json() == {
+        "duration_minutes": 60,
+        "step_minutes": 30,
+        "count": 3,
+        "slots": [
+            {
+                "start_utc": "2026-03-02T07:00:00Z",
+                "end_utc": "2026-03-02T08:00:00Z",
+            },
+            {
+                "start_utc": "2026-03-02T10:30:00Z",
+                "end_utc": "2026-03-02T11:30:00Z",
+            },
+            {
+                "start_utc": "2026-03-02T11:00:00Z",
+                "end_utc": "2026-03-02T12:00:00Z",
+            },
+        ],
+    }
+
+
+def test_common_free_slots_cross_timezone():
+    # 柏林 09:00 CET = 08:00 UTC 忙 60 分钟；纽约 04:30 EST = 09:30 UTC 忙 60 分钟
+    resp = client.post(
+        "/common-free-slots",
+        json=_free_payload(
+            participants=[
+                {"schedules": [_free_schedule("09:00", timezone="Europe/Berlin")]},
+                {
+                    "schedules": [
+                        _free_schedule("04:30", timezone="America/New_York")
+                    ]
+                },
+            ]
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["slots"] == [
+        {"start_utc": "2026-03-02T07:00:00Z", "end_utc": "2026-03-02T08:00:00Z"},
+        {"start_utc": "2026-03-02T10:30:00Z", "end_utc": "2026-03-02T11:30:00Z"},
+        {"start_utc": "2026-03-02T11:00:00Z", "end_utc": "2026-03-02T12:00:00Z"},
+    ]
+
+
+def test_common_free_slots_empty_schedules_fully_free():
+    # null / 空列表 / 缺省 schedules 均表示全程空闲
+    resp = client.post(
+        "/common-free-slots",
+        json=_free_payload(
+            window_start_utc="2026-03-02T08:00:00Z",
+            window_end_utc="2026-03-02T10:00:00Z",
+            duration_minutes=45,
+            step_minutes=30,
+            participants=[{"schedules": []}, {"schedules": None}, {}],
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["slots"] == [
+        {"start_utc": "2026-03-02T08:00:00Z", "end_utc": "2026-03-02T08:45:00Z"},
+        {"start_utc": "2026-03-02T08:30:00Z", "end_utc": "2026-03-02T09:15:00Z"},
+        {"start_utc": "2026-03-02T09:00:00Z", "end_utc": "2026-03-02T09:45:00Z"},
+    ]
+
+
+def test_common_free_slots_fold_both_merges_busy():
+    # 纽约 2026-11-01 01:30 出现两次（05:30 / 06:30 UTC），各 60 分钟且相接
+    # -> 合并为忙碌 [05:30, 07:30)，重复实例不重复占用
+    resp = client.post(
+        "/common-free-slots",
+        json={
+            "window_start_utc": "2026-11-01T05:00:00Z",
+            "window_end_utc": "2026-11-01T09:00:00Z",
+            "duration_minutes": 60,
+            "step_minutes": 30,
+            "participants": [
+                {
+                    "schedules": [
+                        {
+                            "timezone": "America/New_York",
+                            "start_date": "2026-11-01",
+                            "end_date": "2026-11-01",
+                            "weekdays": [6],
+                            "local_time": "01:30",
+                            "fold_strategy": "both",
+                            "duration_minutes": 60,
+                        }
+                    ]
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    # 空闲 [05:00,05:30)（不足 60 分钟）与 [07:30,09:00)
+    assert resp.json()["slots"] == [
+        {"start_utc": "2026-11-01T07:30:00Z", "end_utc": "2026-11-01T08:30:00Z"},
+        {"start_utc": "2026-11-01T08:00:00Z", "end_utc": "2026-11-01T09:00:00Z"},
+    ]
+
+
+def test_common_free_slots_gap_shift_forward():
+    # 纽约 2026-03-08 02:30 不存在；shift_forward 后 03:30 EDT = 07:30 UTC，忙 60 分钟
+    resp = client.post(
+        "/common-free-slots",
+        json={
+            "window_start_utc": "2026-03-08T07:00:00Z",
+            "window_end_utc": "2026-03-08T09:00:00Z",
+            "duration_minutes": 30,
+            "step_minutes": 60,
+            "participants": [
+                {
+                    "schedules": [
+                        {
+                            "timezone": "America/New_York",
+                            "start_date": "2026-03-08",
+                            "end_date": "2026-03-08",
+                            "weekdays": [6],
+                            "local_time": "02:30",
+                            "gap_strategy": "shift_forward",
+                            "duration_minutes": 60,
+                        }
+                    ]
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    # 忙碌 [07:30,08:30)；空闲 [07:00,07:30) 与 [08:30,09:00)
+    # 网格点 07:00 / 08:00 / 09:00：08:00 落在忙碌段，08:30 非网格点 -> 仅 07:00
+    assert resp.json()["slots"] == [
+        {"start_utc": "2026-03-08T07:00:00Z", "end_utc": "2026-03-08T07:30:00Z"}
+    ]
+
+
+def test_common_free_slots_no_common_free_empty_list():
+    # 两人忙碌段相接覆盖整个窗口 -> 无可预约起点
+    resp = client.post(
+        "/common-free-slots",
+        json=_free_payload(
+            window_start_utc="2026-03-02T08:00:00Z",
+            window_end_utc="2026-03-02T10:00:00Z",
+            participants=[
+                {"schedules": [_free_schedule("08:00")]},
+                {"schedules": [_free_schedule("09:00")]},
+            ],
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 0
+    assert resp.json()["slots"] == []
+
+
+def test_common_free_slots_window_must_be_z_utc_422():
+    # 缺少 Z 后缀 / 用 +00:00 代替 Z 均非法
+    resp = client.post(
+        "/common-free-slots",
+        json=_free_payload(window_start_utc="2026-03-02T07:00:00"),
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/common-free-slots",
+        json=_free_payload(window_start_utc="2026-03-02T07:00:00+00:00"),
+    )
+    assert resp.status_code == 422
+
+
+def test_common_free_slots_window_not_increasing_422():
+    # 相等与逆序都非法
+    resp = client.post(
+        "/common-free-slots",
+        json=_free_payload(window_end_utc="2026-03-02T07:00:00Z"),
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/common-free-slots",
+        json=_free_payload(
+            window_start_utc="2026-03-03T00:00:00Z",
+            window_end_utc="2026-03-02T00:00:00Z",
+        ),
+    )
+    assert resp.status_code == 422
+
+
+def test_common_free_slots_window_over_31_days_422():
+    resp = client.post(
+        "/common-free-slots",
+        json=_free_payload(
+            window_start_utc="2026-03-01T00:00:00Z",
+            window_end_utc="2026-04-01T00:00:01Z",  # 31 天零 1 秒
+        ),
+    )
+    assert resp.status_code == 422
+
+
+def test_common_free_slots_window_exactly_31_days_ok():
+    resp = client.post(
+        "/common-free-slots",
+        json=_free_payload(
+            window_start_utc="2026-03-01T00:00:00Z",
+            window_end_utc="2026-04-01T00:00:00Z",  # 恰好 31 天
+            step_minutes=1440,
+            participants=[{"schedules": None}],
+        ),
+    )
+    assert resp.status_code == 200
+
+
+def test_common_free_slots_duration_bounds():
+    resp = client.post("/common-free-slots", json=_free_payload(duration_minutes=0))
+    assert resp.status_code == 422
+
+    resp = client.post("/common-free-slots", json=_free_payload(duration_minutes=1441))
+    assert resp.status_code == 422
+
+    # 1440 合法（窗口容不下时仅返回空列表）
+    resp = client.post("/common-free-slots", json=_free_payload(duration_minutes=1440))
+    assert resp.status_code == 200
+    assert resp.json()["slots"] == []
+
+
+def test_common_free_slots_step_bounds():
+    resp = client.post("/common-free-slots", json=_free_payload(step_minutes=0))
+    assert resp.status_code == 422
+
+    resp = client.post("/common-free-slots", json=_free_payload(step_minutes=1441))
+    assert resp.status_code == 422
+
+    # 1440 合法
+    resp = client.post("/common-free-slots", json=_free_payload(step_minutes=1440))
+    assert resp.status_code == 200
+
+
+def test_common_free_slots_participant_count_bounds():
+    resp = client.post("/common-free-slots", json=_free_payload(participants=[]))
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/common-free-slots",
+        json=_free_payload(participants=[{"schedules": None}] * 11),
+    )
+    assert resp.status_code == 422
+
+    # 10 名合法
+    resp = client.post(
+        "/common-free-slots",
+        json=_free_payload(participants=[{"schedules": None}] * 10),
+    )
+    assert resp.status_code == 200
+
+
+def test_common_free_slots_reuses_schedule_validation():
+    # 日程沿用 /overlaps 单侧校验：非法时区 / 时长越界 / 区间超 366 天均 422
+    resp = client.post(
+        "/common-free-slots",
+        json=_free_payload(
+            participants=[{"schedules": [_free_schedule("08:00", timezone="Not/AZone")]}]
+        ),
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/common-free-slots",
+        json=_free_payload(participants=[{"schedules": [_free_schedule("08:00", 0)]}]),
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/common-free-slots",
+        json=_free_payload(
+            participants=[
+                {
+                    "schedules": [
+                        _free_schedule(
+                            "08:00",
+                            start_date="2026-01-01",
+                            end_date="2027-01-03",
+                        )
+                    ]
+                }
+            ]
+        ),
+    )
+    assert resp.status_code == 422

@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 MAX_RANGE_DAYS = 366
+MAX_WINDOW_DAYS = 31
 
 
 def _check_iana_timezone(v: str) -> str:
@@ -166,16 +167,14 @@ class StaffingEmployee(BaseModel):
     )
 
 
-class StaffingGapsRequest(BaseModel):
+class UtcWindowRequest(BaseModel):
+    """UTC 半开查询窗口的公共校验：必须以 Z 结尾、归一化为 UTC。"""
+
     window_start_utc: datetime = Field(
         ..., description="查询窗口起点（含），UTC，ISO 8601 且以 Z 结尾"
     )
     window_end_utc: datetime = Field(
         ..., description="查询窗口终点（不含），UTC，ISO 8601 且以 Z 结尾"
-    )
-    min_staff: int = Field(..., ge=1, description="最低在岗人数，1～员工总数")
-    employees: list[StaffingEmployee] = Field(
-        ..., min_length=1, max_length=20, description="1～20 名员工，ID 唯一"
     )
 
     @field_validator("window_start_utc", "window_end_utc", mode="before")
@@ -192,6 +191,13 @@ class StaffingGapsRequest(BaseModel):
         if v.tzinfo is None or v.utcoffset() is None:
             raise ValueError("must be a timezone-aware UTC timestamp ending with 'Z'")
         return v.astimezone(timezone.utc)
+
+
+class StaffingGapsRequest(UtcWindowRequest):
+    min_staff: int = Field(..., ge=1, description="最低在岗人数，1～员工总数")
+    employees: list[StaffingEmployee] = Field(
+        ..., min_length=1, max_length=20, description="1～20 名员工，ID 唯一"
+    )
 
     @model_validator(mode="after")
     def _validate_window_and_staffing(self) -> "StaffingGapsRequest":
@@ -252,4 +258,49 @@ class RestViolationsResponse(BaseModel):
     count: int = Field(..., description="休息不足的空档数")
     violations: list[RestViolationOut] = Field(
         ..., description="低于阈值的空档，按起点排序；均达标时为空列表"
+    )
+
+
+class FreeSlotsParticipant(BaseModel):
+    """一名参与者：可为空的日程列表（沿用 /overlaps 单侧参数与校验）。"""
+
+    schedules: list[OverlapSide] | None = Field(
+        default=None,
+        description="日程列表（与 /overlaps 单侧相同）；null 或空列表表示全程空闲",
+    )
+
+
+class CommonFreeSlotsRequest(UtcWindowRequest):
+    duration_minutes: int = Field(
+        ..., ge=1, le=1440, description="预约时长（分钟），1～1440"
+    )
+    step_minutes: int = Field(
+        ..., ge=1, le=1440, description="候选起点步长（分钟），1～1440"
+    )
+    participants: list[FreeSlotsParticipant] = Field(
+        ..., min_length=1, max_length=10, description="1～10 名参与者"
+    )
+
+    @model_validator(mode="after")
+    def _validate_window(self) -> "CommonFreeSlotsRequest":
+        if not self.window_start_utc < self.window_end_utc:
+            raise ValueError("window_start_utc must be before window_end_utc")
+        if self.window_end_utc - self.window_start_utc > timedelta(
+            days=MAX_WINDOW_DAYS
+        ):
+            raise ValueError(f"window must not exceed {MAX_WINDOW_DAYS} days")
+        return self
+
+
+class FreeSlotOut(BaseModel):
+    start_utc: str = Field(..., description="可预约起点（含），UTC，Z 结尾")
+    end_utc: str = Field(..., description="对应预约终点（不含），UTC，Z 结尾")
+
+
+class CommonFreeSlotsResponse(BaseModel):
+    duration_minutes: int = Field(..., description="预约时长（分钟）")
+    step_minutes: int = Field(..., description="候选起点步长（分钟）")
+    count: int = Field(..., description="可预约起点数")
+    slots: list[FreeSlotOut] = Field(
+        ..., description="能完整容纳预约的网格起点及对应终点，按 UTC 升序"
     )

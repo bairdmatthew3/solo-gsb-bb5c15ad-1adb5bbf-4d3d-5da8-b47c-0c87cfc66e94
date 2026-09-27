@@ -8,6 +8,7 @@ from app.scheduler import (
     RestViolation,
     StaffingGap,
     classify,
+    common_free_slots,
     expand_schedule,
     find_overlaps,
     merge_intervals,
@@ -493,3 +494,121 @@ def test_rest_violations_unsorted_input_and_single_segment():
     assert violations == [RestViolation(_utc(1, 9), _utc(1, 10))]
     assert rest_violations(intervals=[(_utc(1, 8), _utc(1, 9))], min_rest_minutes=1) == []
     assert rest_violations(intervals=[], min_rest_minutes=1) == []
+
+
+# --- common_free_slots ------------------------------------------------------
+
+
+def test_common_free_slots_basic():
+    # alice 忙 [08:00,09:00)，bob 忙 [09:30,10:30)；窗口 [07:00,12:00)
+    # 共同空闲 [07:00,08:00) [09:00,09:30) [10:30,12:00)，时长 60、步长 30：
+    # [09:00,09:30) 不足 60 分钟；[10:30,12:00) 内容纳 10:30、11:00（11:30 起越界）
+    slots = common_free_slots(
+        window_start=_utc(1, 7),
+        window_end=_utc(1, 12),
+        duration_minutes=60,
+        step_minutes=30,
+        participant_intervals=[
+            [(_utc(1, 8), _utc(1, 9))],
+            [(_utc(1, 9, 30), _utc(1, 10, 30))],
+        ],
+    )
+    assert slots == [
+        (_utc(1, 7), _utc(1, 8)),
+        (_utc(1, 10, 30), _utc(1, 11, 30)),
+        (_utc(1, 11), _utc(1, 12)),
+    ]
+
+
+def test_common_free_slots_grid_origin_is_window_start():
+    # 网格从窗口起点起算：窗口 [07:15, 09:00)，全程空闲，时长 30、步长 45
+    # 网格点 07:15 / 08:00 / 08:45；08:45+30=09:15 越界 -> 仅前两个
+    slots = common_free_slots(
+        window_start=_utc(1, 7, 15),
+        window_end=_utc(1, 9),
+        duration_minutes=30,
+        step_minutes=45,
+        participant_intervals=[[], []],
+    )
+    assert slots == [
+        (_utc(1, 7, 15), _utc(1, 7, 45)),
+        (_utc(1, 8), _utc(1, 8, 30)),
+    ]
+
+
+def test_common_free_slots_merges_touching_busy_per_person():
+    # 同一人的相接忙碌段合并：[08:00,09:00) 与 [09:00,10:00) -> [08:00,10:00)
+    slots = common_free_slots(
+        window_start=_utc(1, 7),
+        window_end=_utc(1, 11),
+        duration_minutes=60,
+        step_minutes=60,
+        participant_intervals=[[(_utc(1, 8), _utc(1, 9)), (_utc(1, 9), _utc(1, 10))]],
+    )
+    assert slots == [(_utc(1, 7), _utc(1, 8)), (_utc(1, 10), _utc(1, 11))]
+
+
+def test_common_free_slots_boundary_touch_allowed():
+    # 忙 [09:00,10:00)：预约终点恰为 09:00、起点恰为 10:00 均允许
+    slots = common_free_slots(
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 12),
+        duration_minutes=60,
+        step_minutes=60,
+        participant_intervals=[[(_utc(1, 9), _utc(1, 10))]],
+    )
+    assert slots == [
+        (_utc(1, 8), _utc(1, 9)),
+        (_utc(1, 10), _utc(1, 11)),
+        (_utc(1, 11), _utc(1, 12)),
+    ]
+
+
+def test_common_free_slots_clips_busy_to_window_and_aligns_grid():
+    # 忙碌段越界部分被裁剪；空闲段起点不对齐网格时取下一个网格点
+    slots = common_free_slots(
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 10),
+        duration_minutes=30,
+        step_minutes=60,
+        participant_intervals=[
+            [(_utc(1, 6), _utc(1, 8, 30)), (_utc(1, 9, 30), _utc(1, 12))]
+        ],
+    )
+    # 裁剪后忙碌 [08:00,08:30) [09:30,10:00)；空闲 [08:30,09:30)
+    # 网格点 08:00 / 09:00 / 10:00 -> 仅 09:00（08:30 非网格点）
+    assert slots == [(_utc(1, 9), _utc(1, 9, 30))]
+
+
+def test_common_free_slots_no_common_free():
+    # 两人忙碌段相接覆盖整个窗口 -> 无共同空闲
+    assert (
+        common_free_slots(
+            window_start=_utc(1, 8),
+            window_end=_utc(1, 10),
+            duration_minutes=60,
+            step_minutes=30,
+            participant_intervals=[
+                [(_utc(1, 8), _utc(1, 9))],
+                [(_utc(1, 9), _utc(1, 10))],
+            ],
+        )
+        == []
+    )
+
+
+def test_common_free_slots_all_free_full_window_grid():
+    # 全部空闲：窗口 [08:00, 10:00)，时长 45、步长 30
+    # 网格 08:00(+45 ✓) / 08:30 ✓ / 09:00 ✓ / 09:30(+45=10:15 越界)
+    slots = common_free_slots(
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 10),
+        duration_minutes=45,
+        step_minutes=30,
+        participant_intervals=[[]],
+    )
+    assert slots == [
+        (_utc(1, 8), _utc(1, 8, 45)),
+        (_utc(1, 8, 30), _utc(1, 9, 15)),
+        (_utc(1, 9), _utc(1, 9, 45)),
+    ]

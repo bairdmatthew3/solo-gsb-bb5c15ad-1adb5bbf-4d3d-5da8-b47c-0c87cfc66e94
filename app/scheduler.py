@@ -325,6 +325,54 @@ def staffing_gaps(
     return merged
 
 
+def common_free_slots(
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    duration_minutes: int,
+    step_minutes: int,
+    participant_intervals: Iterable[Iterable[tuple[datetime, datetime]]],
+) -> list[tuple[datetime, datetime]]:
+    """枚举窗口 [window_start, window_end) 内所有人共同空闲的可预约网格起点。
+
+    每人的半开忙碌区间先各自合并（相交或相接者并成一段，重复实例不重复
+    占用），再取所有人的并集并裁剪到窗口；窗口减去忙碌并集即为共同空闲段。
+    以窗口起点为网格原点、step_minutes 为步长生成候选起点，仅保留能完整
+    容纳 [start, start+duration) 的起点（边界相接允许预约）。
+    返回 [(起点, 终点)]，按 UTC 升序。
+    """
+    span = timedelta(minutes=duration_minutes)
+    step = timedelta(minutes=step_minutes)
+
+    busy: list[tuple[datetime, datetime]] = []
+    for intervals in participant_intervals:
+        for start, end in merge_intervals(intervals):
+            clipped = (max(start, window_start), min(end, window_end))
+            if clipped[0] < clipped[1]:
+                busy.append(clipped)
+    busy = merge_intervals(busy)
+
+    # 窗口减去忙碌并集 -> 共同空闲段（半开，按起点排序）
+    free: list[tuple[datetime, datetime]] = []
+    cursor = window_start
+    for start, end in busy:
+        if cursor < start:
+            free.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < window_end:
+        free.append((cursor, window_end))
+
+    slots: list[tuple[datetime, datetime]] = []
+    for free_start, free_end in free:
+        # 第一个 >= free_start 的网格点：window_start + k * step（k 向上取整）
+        k = -(-(free_start - window_start) // step)
+        start = window_start + k * step
+        while start + span <= free_end:  # 边界相接允许预约
+            slots.append((start, start + span))
+            start += step
+    return slots
+
+
 def utc_iso(dt: datetime) -> str:
     """把 UTC 时刻格式化为 Z 结尾的 ISO 8601 字符串。"""
     return dt.isoformat().replace("+00:00", "Z")

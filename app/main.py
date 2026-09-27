@@ -8,10 +8,13 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI
 
 from .models import (
+    CommonFreeSlotsRequest,
+    CommonFreeSlotsResponse,
     DailyOccupancyRequest,
     DailyOccupancyResponse,
     ExpandRequest,
     ExpandResponse,
+    FreeSlotOut,
     OverlapRequest,
     OverlapResponse,
     RestViolationOut,
@@ -22,6 +25,7 @@ from .models import (
     StaffingGapsResponse,
 )
 from .scheduler import (
+    common_free_slots,
     expand_schedule,
     find_overlaps,
     instance_payload,
@@ -40,7 +44,8 @@ app = FastAPI(
         "按策略生成去重且按 UTC 稳定排序的实例，"
         "并可检测两个日程在真实时间轴上的重叠、按报告时区统计逐日占用，"
         "按 UTC 窗口扫描多员工在岗人数缺口，"
-        "以及检查同一员工相邻工作段之间的休息是否低于最低分钟数。"
+        "检查同一员工相邻工作段之间的休息是否低于最低分钟数，"
+        "以及在 UTC 窗口内按步长网格查询多人共同空闲的可预约起点。"
     ),
 )
 
@@ -215,5 +220,47 @@ def rest_violations_check(req: RestViolationsRequest) -> RestViolationsResponse:
                 shortfall_minutes=req.min_rest_minutes - v.rest_minutes,
             )
             for v in violations
+        ],
+    )
+
+
+@app.post(
+    "/common-free-slots",
+    response_model=CommonFreeSlotsResponse,
+    summary="查询多人共同空闲的可预约起点",
+)
+def common_free_slots_check(req: CommonFreeSlotsRequest) -> CommonFreeSlotsResponse:
+    # 每名参与者的各条日程按原 gap/fold 策略展开，实例按真实时长转为半开 UTC 区间
+    participant_intervals: list[list[tuple[datetime, datetime]]] = []
+    for participant in req.participants:
+        intervals: list[tuple[datetime, datetime]] = []
+        for side in participant.schedules or []:
+            tz = ZoneInfo(side.timezone)
+            instances, _ = expand_schedule(
+                tz=tz,
+                start_date=side.start_date,
+                end_date=side.end_date,
+                weekdays=side.weekdays,
+                local_time=side.local_time,
+                gap_strategy=side.gap_strategy.value,
+                fold_strategy=side.fold_strategy.value,
+            )
+            span = timedelta(minutes=side.duration_minutes)
+            intervals.extend((i.utc, i.utc + span) for i in instances)
+        participant_intervals.append(intervals)
+    slots = common_free_slots(
+        window_start=req.window_start_utc,
+        window_end=req.window_end_utc,
+        duration_minutes=req.duration_minutes,
+        step_minutes=req.step_minutes,
+        participant_intervals=participant_intervals,
+    )
+    return CommonFreeSlotsResponse(
+        duration_minutes=req.duration_minutes,
+        step_minutes=req.step_minutes,
+        count=len(slots),
+        slots=[
+            FreeSlotOut(start_utc=utc_iso(start), end_utc=utc_iso(end))
+            for start, end in slots
         ],
     )
